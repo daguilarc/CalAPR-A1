@@ -1,3 +1,9 @@
+> **SUPERSEDED 2026-07-16.** This change's CO-only pair-registry direction is replaced by the
+> Bipartite OG Explorer plan (`~/.cursor/plans/bipartite_og_explorer_f5916984.plan.md`), which
+> takes the explorer to a bipartite housing×3-econ cross-section. Archived without applying its
+> spec deltas (its pair-registry/pages-explorer-ui direction is being replaced, not shipped).
+> The CO-only phase-guard code work it describes already landed in `pages/pair_registry.py`.
+
 ## Why
 
 A prior implementation pass flipped the Pages/Jupyter explorer from CO (Certificates of Occupancy) to ENT (Entitlements). Verified state:
