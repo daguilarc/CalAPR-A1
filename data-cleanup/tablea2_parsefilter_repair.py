@@ -731,10 +731,18 @@ def _identity_matches(identity_index, identity):
 
 
 def _apply_mapped_to_df_row(df, idx, mapped):
-    """Write mapped payload values into a single DataFrame row."""
+    """Write mapped payload values into a single DataFrame row.
+
+    Mapped values are workbook strings. Assigning one into a numeric column used to let
+    pandas upcast the column implicitly, which is deprecated and will raise in a future
+    pandas. Cast the column to object first: same resulting values, no warning.
+    """
     for col, val in mapped.items():
-        if col in df.columns:
-            df.at[idx, col] = val
+        if col not in df.columns:
+            continue
+        if isinstance(val, str) and pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = df[col].astype(object)
+        df.at[idx, col] = val
 
 
 def _apply_paired_upserts(pairs, df, identity):
