@@ -1,60 +1,23 @@
 # * = any filename; ** = any directory depth
 **/__pycache__/
-**/tablea2.csv
-**/tablea2_cleaned.csv
-**/malformed_rows.csv
+
+# Data + generated artifacts: raw input (tablea2.csv), cleaned output, repair
+# diagnostics, chart PNGs, flowcharts. The .xlsm source workbooks are tracked.
 *.csv
 *.png
-*.json
+*.log
 *.zip
 *.xlsx
+
+# Markdown is local-only except this README (e.g. AGENTS.md stays out of the repo)
 *.md
-!docs/PAGES_SETUP.md
-!docs/index.html
-!docs/chart_labels.json
-!docs/data/releases/
-!docs/data/releases/**/*
 !README.md
-!requirements-pages-release.txt
-!requirements-pages-release.lock
-*.log
 
-# GitHub Pages census cache bundle
-!docs/data/census/
-!docs/data/census/*.json
-
-# TIGER boundaries downloaded locally (CI uses TableA2-models/maps/boundaries)
-docs/data/boundaries/
-TableA2-models/maps/boundaries/
-
-# Census county FIPS reference (auto-downloaded by acs_apr_models.py if absent)
-**/national_county2020.txt
-
-# Local agent scratch / deps / personal
+# Local agent scratch / personal
 .superpowers/
-e2e/node_modules/
-e2e/.pw-browsers/
-e2e/test-results/
+.claude/
+.cursor/
+.venv-pages/
+.mplconfig/
+.DS_Store
 Chase_*.pdf
-
-# Original-publication PNG generator + fit-once/render-both driver: kept locally, excluded from the public repo
-/scripts/run_original_models.py
-/scripts/build_full_release.py
-/TableA2-models/original/
-
-# Re-include release JSON after the blanket *.json ignore
-!docs/data/releases/**/*.json
-!docs/data/releases/**/*.js
-!docs/data/releases/**/*.geojson
-
-# Local release backups: keep on disk, exclude from repo
-docs/data/releases/*.bak-*/
-docs/data/releases/_backups/
-
-# Local-only Python test suite (kept on disk, not published)
-tests/
-TableA2-models/test_pair_registry.py
-TableA2-models/r2_diagnostics_filtered_both_model_types_two_coeffs.tsv
-
-# Local-only dev-process docs (kept on disk, not published; nothing at runtime reads these)
-openspec/

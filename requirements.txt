@@ -3,20 +3,8 @@ pandas>=2.0
 numpy>=1.24
 openpyxl>=3.1
 
-# scripts/basic_apr_charts.py
+# charts/basic_apr_charts.py
 matplotlib>=3.7
 
-# Not imported by anything at this scope (data-cleanup / scripts). Retained
-# only for parity with TableA2-models/requirements.txt, which lists it for
-# an actual caller (acs_apr_models.py, pages/db_maps.py). Safe to drop here
-# if this file is ever scoped strictly to the root pipeline.
-requests>=2.28
-
-# TableA2-models/acs_apr_models.py
-scipy>=1.10
-pymc>=5.0
-statsmodels>=0.14
-arch>=6.0
-firthmodels>=0.3
-tqdm>=4.65
-scikit-learn>=1.3
+# All other modules used (csv, io, re, warnings, collections, pathlib, sys)
+# are part of Python's standard library.

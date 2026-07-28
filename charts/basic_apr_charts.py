@@ -18,12 +18,12 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, MaxNLocator, StrMethodFormatter
 from pathlib import Path
 
-# Paths: this script lives in scripts/; the cleaned CSV it reads and the charts/ directory
-# it writes both live at the repo root. The repair script lives in data-cleanup/.
+# Paths: this script lives in charts/ and writes its PNGs beside itself there. The cleaned
+# CSV it reads lives at the repo root; the repair script that produces it is in data-cleanup/.
 _DATA_ROOT = Path(__file__).resolve().parent.parent
 _CLEANUP_DIR = _DATA_ROOT / "data-cleanup"
 DATA_PATH = _DATA_ROOT / "tablea2_cleaned_parsefilter_repair.csv"
-OUTPUT_DIR = _DATA_ROOT / "charts"
+OUTPUT_DIR = Path(__file__).resolve().parent
 
 if not DATA_PATH.exists():
     sys.path.insert(0, str(_CLEANUP_DIR))

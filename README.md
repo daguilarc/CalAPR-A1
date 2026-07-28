@@ -1,47 +1,44 @@
 # CSVparse_hcd_apr
 
-California HCD Annual Progress Report (APR) parsing, publication models, and the static [APR Explorer](https://data.ca.gov/dataset/housing-element-annual-progress-report-apr-data-by-jurisdiction-and-year).
+California HCD [Annual Progress Report (APR)](https://data.ca.gov/dataset/housing-element-annual-progress-report-apr-data-by-jurisdiction-and-year) Table A2 parsing, repair, and charts.
 
-## Where to start
+## Pipeline
 
-The data-cleaning entry point is **`data-cleanup/tablea2_parsefilter_repair.py`**. It parses and repairs the raw APR CSV export (`tablea2.csv`, at the repo root) together with the nine `*.xlsm` source workbooks (`Bell2019.xlsm`, `Bell2023.xlsm`, `Campbell2024.xlsm`, `Ceres2020.xlsm`, `Colfax2021.xlsm`, `Hesperia2022.xlsm`, `Hesperia2023.xlsm`, `Hesperia2024.xlsm`, `Irvine2022.xlsm`), which live beside it in `data-cleanup/`. Its cleaned output is written to the repo root. Everything downstream — charts, models, the Pages catalog — consumes its cleaned output.
+Two steps: clean the raw HCD export, then chart the cleaned data.
 
-## Entry points
-
-| Pipeline | Command |
-|----------|---------|
+| Step | Command |
+|------|---------|
 | **Data cleaning** | `python data-cleanup/tablea2_parsefilter_repair.py` |
-| **Charts from cleaned data** | `python scripts/basic_apr_charts.py` |
-| **Pages catalog (full ENT-only Cartesian)** | `python scripts/export_pages_catalog.py --release-id 2018-2024 --staging-dir <path>` |
-| **Bootstrap Pages caches (CI)** | `python scripts/bootstrap_pages_data.py` |
-| **Verify release** | `python scripts/verify_pages_catalog.py <staging-path>` |
-| **Explorer e2e (after full build)** | `scripts/run_explorer_e2e.sh` |
-| **Fixture smoke (not Playwright)** | `scripts/setup_local_site_test.sh` |
-| **Static site** | `python3 -m http.server 8765 --directory docs` |
+| **Charts from cleaned data** | `python charts/basic_apr_charts.py` |
 
-`scripts/bootstrap_pages_data.py` restores the committed census caches and downloaded map boundaries into `TableA2-models/` before a Pages CI build; it's invoked automatically by CI and doesn't need to be run by hand for local work.
+The chart script runs the cleaning step automatically if the cleaned CSV isn't already present, so `python charts/basic_apr_charts.py` alone is enough on a fresh checkout.
 
-Full build → verify → promote to `docs/data/releases/2018-2024/` → Playwright. See `docs/PAGES_SETUP.md`.
+## Data cleaning
+
+`data-cleanup/tablea2_parsefilter_repair.py` parses and repairs the raw APR CSV export (`tablea2.csv`, at the repo root) and reconciles truncated/malformed rows against the source `*.xlsm` workbooks that live beside it in `data-cleanup/` (`Bell2019.xlsm`, `Bell2023.xlsm`, `Campbell2024.xlsm`, `Ceres2020.xlsm`, `Colfax2021.xlsm`, `Hesperia2022.xlsm`, `Hesperia2023.xlsm`, `Hesperia2024.xlsm`, `Irvine2022.xlsm`). It performs structural quote repair, date/year validation, deduplication, and XLSM-backed recovery of truncated rows.
+
+Outputs, all written to the repo root:
+
+- `tablea2_cleaned_parsefilter_repair.csv` — the cleaned dataset the charts read.
+- `matched_truncated_repair.csv`, `unmatched_truncated_repair.csv`, `ambiguous_truncated_repair.csv` — truncated-row recovery diagnostics.
+- `date_year_mismatch_rows_parsefilter_repair.csv` — rows dropped for date/year validation.
+
+The module docstring documents the full pipeline order, the stable identity key, XLSM lookup order, and the upsert/ambiguity rules. `flowchart1_main_pipeline.png`, `flowchart2_workbook_upsert.png`, and `flowchart3_date_year_mismatch.png` diagram the same flow.
+
+## Charts
+
+`charts/basic_apr_charts.py` generates the matplotlib PNGs from the cleaned APR data, written into `charts/`. Color scheme is colorblind-friendly (blue, orange, purple, gray).
 
 ## Layout
 
-- **`data-cleanup/`** — `tablea2_parsefilter_repair.py`, the data-cleaning entry point described above, plus the nine `*.xlsm` source workbooks it reads.
-- **`charts/`** — matplotlib PNGs written by `scripts/basic_apr_charts.py` (git-ignored build output).
-- **`TableA2-models/`** — `acs_apr_models.py` (shared modeling library), `panel_context.py` (shared prep steps), and `pages/` (the explorer catalog pipeline).
-- **`scripts/`** — `basic_apr_charts.py` plus the release build/verify/bootstrap glue; see the Entry points table above.
-- **`docs/`** — the published static site (`docs/index.html`) plus `docs/data/releases/<id>/`, the immutable release archives.
-- **`e2e/`** — Playwright browser tests for the published explorer (CI-wired).
-- **`notebooks/`** — `apr_explorer.ipynb`, a notebook consumer of an archived release; see `docs/PAGES_SETUP.md`.
-- **`requirements.txt`, `requirements-pages-release.txt`, `requirements-pages-release.lock`** — see Dependencies below.
+- **`data-cleanup/`** — `tablea2_parsefilter_repair.py`, the data-cleaning entry point, plus the nine `*.xlsm` source workbooks it reads.
+- **`charts/`** — `basic_apr_charts.py` and its PNG output (PNGs are git-ignored).
+- **`tablea2.csv`** — raw HCD APR export (git-ignored input); place it at the repo root.
 
 ## Dependencies
 
-External Python packages required for the cleaning + charts pipeline (`data-cleanup/tablea2_parsefilter_repair.py`, `scripts/basic_apr_charts.py`) are listed in `requirements.txt`: **pandas**, **numpy**, **openpyxl** (workbook parsing), and **matplotlib** (charts). Install with:
+`requirements.txt` lists the four external packages the pipeline needs: **pandas**, **numpy**, **openpyxl** (workbook parsing), and **matplotlib** (charts). Everything else it uses is in the Python standard library.
 
 ```bash
 pip install -r requirements.txt
 ```
-
-`TableA2-models/` (the Pages/explorer pipeline) is a separate, larger concern with its own dependency set — see `TableA2-models/requirements.txt` for the direct list and `requirements-pages-release.txt` / `requirements-pages-release.lock` for the exact pinned release environment. Don't install those unless you're working on the Pages catalog build.
-
-All other modules used at the root (`csv`, `io`, `re`, `warnings`, `collections`, `pathlib`, `sys`) are part of Python's standard library.
