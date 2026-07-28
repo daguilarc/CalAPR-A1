@@ -5,7 +5,8 @@ Purpose
 - Structural CSV repair, pandas load, in-memory fixes, date/year validation, APR dedup.
 - For deduped truncated-closer identities, look up the authoritative row in source
   `Table A2` workbooks (openpyxl) and upsert mapped APR fields into the working
-  DataFrame (update if one matching APR row exists, else append one row).
+  DataFrame. See "Upsert behavior" below for the complete set of outcomes — update and
+  append are the common two, but not the only ones that write.
 
 Two grains (do not conflate)
 - Truncated physical lines: rows from `_extract_truncated_closer_rows` (one per broken
@@ -18,21 +19,23 @@ Inputs
   and all diagnostic CSVs are written there too, where downstream consumers read them.
 - Workbooks: `{Juris}{YEAR}.xlsm` beside this script in `data-cleanup/`, e.g. Campbell + 2024 ->
   `Campbell2024.xlsm`. Non-alphanumeric characters are stripped from `JURIS_NAME` for the
-  stem. Lock files `~$*.xlsm` are ignored by convention (they are not used).
-- Current workbook files available for upsert lookup (present in this directory; only a subset may be used per run):
-  `Bell2019.xlsm`, `Bell2023.xlsm`, `Campbell2024.xlsm`, `Ceres2020.xlsm`,
-  `Colfax2021.xlsm`, `Hesperia2022.xlsm`, `Hesperia2023.xlsm`, `Hesperia2024.xlsm`,
-  `Irvine2022.xlsm`.
+  stem. Lock files `~$*.xlsm` are ignored by convention (they are not used). Whichever
+  workbooks are present in that directory are the ones available for lookup; a run uses only
+  those an identity actually resolves to, and a missing workbook is an unresolved upsert.
 - Sheet: only `Table A2`. Header row is the first row (within ~80 rows) whose cell set
   contains both `A2_1_ID` and `A2_18_Affordable`.
 
 Stable identity key (dedupe and APR update match)
-- Tuple: (JURIS_NAME, CNTY_NAME, YEAR, APN, STREET_ADDRESS, JURS_TRACKING_ID), compared
-  after strip + upper for strings; missing values normalize to empty.
+- Defined once as `IDENTITY_KEY_COLS`; compared after `_norm_str` (strip + upper, with
+  missing/`nan`/`none` normalizing to empty).
 - `JURS_TRACKING_ID` empty is allowed; `APN == "N/A"` is weak—lookup prefers tracking id
   when present and not `N/A`.
+- Note an intentional asymmetry: `_classify_truncated_rows` (step 7) does NOT use `_norm_str`.
+  It normalizes with `astype(str).strip().upper()`, so a missing value keys as "NAN" rather
+  than "". That stage only matches diagnostics to clean rows; changing it would silently
+  change which truncated lines are reported as matched.
 
-XLSM row lookup order (first hit wins; multiple hits in that bucket => ambiguous unless equivalent-collapse applies)
+XLSM row lookup order (first hit wins; for multiple hits in a bucket see "Upsert behavior")
 1) `A2_1_ID` matches normalized `JURS_TRACKING_ID` when tracking id is non-empty and not `N/A`.
 2) Else (`A2_1_Current`, `A2_1_Address`) matches normalized (`APN`, `STREET_ADDRESS`).
 3) Else `A2_1_Current` matches normalized `APN`.
@@ -41,20 +44,44 @@ Row-number semantics for diagnostics
 - XLSM candidate provenance uses worksheet 1-based row numbers (UI-visible Excel row numbers).
 - Ambiguous and integrity diagnostics export stage + candidate row numbers to avoid DataFrame-index confusion.
 
-Upsert behavior
-- If exactly one XLSM row matches and exactly one APR row matches the identity key: in-place
-  update of mapped columns only (see `map_a2_row_to_apr_record`).
-- If exactly one XLSM row matches and zero APR rows match: append one synthetic APR row;
-  unmapped columns use dtype-consistent defaults (`NaN` for numeric, `""` for object).
-- If tracking-id stage returns candidates with non-matching `A2_1_ID` (unexpected; guardrail check):
-  emit integrity diagnostic (no write), listed in `ambiguous_truncated_repair.csv` with
+Upsert behavior (every write path is listed; each identity takes exactly one outcome)
+- Workbook missing, or zero XLSM matches: unresolved, no write
+  -> `truncated_identities_unresolved`.
+- Tracking-id stage returned a candidate whose `A2_1_ID` is not the expected tracking id
+  (guardrail; unexpected): integrity diagnostic, no write
+  -> `truncated_xlsm_match_integrity_errors`, row in `ambiguous_truncated_repair.csv` with
   `ambiguity_stage=xlsm_match_integrity_error`.
-- If multiple XLSM rows match: compare normalized mapped payloads first. If all payloads are equal,
-  collapse deterministically to the candidate with the smallest Excel row number (tie: workbook order).
-  If payloads differ: ambiguous (no write) with `ambiguity_stage=xlsm_multi_match`.
-- If one XLSM row matches but multiple APR rows match the identity key: ambiguous (no write);
-  `ambiguity_stage=df_multi_match`.
-- If workbook missing or zero XLSM matches: unresolved upsert (counted in stdout only).
+- Multiple XLSM rows match: normalized mapped payloads are compared first.
+  * All payloads equal -> collapse to the candidate with the smallest Excel row number (tie:
+    workbook order) and continue as the single-candidate case below. The collapse is recorded
+    by the orthogonal flag `truncated_xlsm_equivalent_duplicates_collapsed`, which is NOT an
+    outcome bucket: it co-occurs with whatever outcome the identity then reaches.
+  * Payloads differ -> phase-count pairing is attempted (see next bullet). Only if pairing
+    fails is the identity ambiguous, no write, `ambiguity_stage=xlsm_multi_match`.
+- Phase-count pairing (`_pair_xlsm_to_df_by_phase`) resolves the many-to-many cases that would
+  otherwise be ambiguous. It requires an equal number of XLSM candidates and matching APR rows,
+  then: pass 1 matches candidates to APR rows whose phase counts (`PHASE_APR_COLS`) agree
+  exactly; pass 2 assigns the remaining candidates to "skeleton" APR rows whose phase counts are
+  all zero (typically rows whose counts were lost to truncation). If every candidate pairs
+  uniquely, each is written to its paired row -> the identity counts ONCE in
+  `truncated_identities_resolved_paired`, and the number of rows it wrote is reported separately
+  as `truncated_rows_updated_via_pairing`. If pairing fails, the identity is ambiguous with
+  `ambiguity_stage=xlsm_multi_match` (multi-candidate route) or `df_multi_match` (single
+  candidate, several APR rows).
+- Single resolved candidate, exactly one matching APR row: in-place update of mapped columns
+  only (see `map_a2_row_to_apr_record`) -> `truncated_identities_resolved_update`.
+- Single resolved candidate, zero matching APR rows: append one synthetic APR row; unmapped
+  columns use dtype-consistent defaults (`NaN` for numeric, `""` for object)
+  -> `truncated_identities_resolved_append`.
+- Accounting invariant, enforced in `main` (raises on violation): detected ==
+  update + append + paired + ambiguous + unresolved + integrity_errors.
+
+Performance notes (these shape the code; do not "simplify" them back)
+- Appends are accumulated and applied in ONE concat after the identity loop. Per-row concat
+  copied the whole ~785k-row frame once per appended row.
+- The identity -> APR row lookup is a dict built once before the loop (`_build_identity_index`),
+  not a full-frame scan per identity. It is deliberately NOT updated as rows are appended,
+  which is consistent with appends being deferred to after the loop.
 
 Post-upsert text cleanup
 - Lone U+0022 in `NO_FA_DR`, `NOTES`, `FIN_ASSIST_NAME` is cleared to empty (counted in
@@ -67,43 +94,27 @@ Truncated diagnostics (separate from upsert ambiguity)
   `unmatched_truncated_repair.csv`. This is not the same set as upsert-ambiguous identities.
 
 Pipeline order
-1) structural quote repair + line-range parse diagnostics (raw vs fixed text)
+1) structural quote repair + line-range parse diagnostics (raw vs fixed text). The set of
+   closer-repaired line numbers is returned by `_repair_quote_corruption` itself and must not
+   be reconstructed by re-scanning the raw text: a rescan splits without line terminators and
+   so silently misses lines whose triple-quote is closed by the newline rather than a comma.
 2) `pd.read_csv(fixed_csv, on_bad_lines="skip")` -> working `df`
 3) `_strip_affordability_trailing_quotes`, `_repair_column_shift_rows`
 4) `_extract_truncated_closer_rows` -> truncated physical lines
-5) dedupe identities -> XLSM lookup -> upsert -> lone-quote cleanup
+5) dedupe identities -> XLSM lookup -> upsert (appends batched) -> lone-quote cleanup
 6) `_row_date_phase_status` + valid YEAR filter + `_deduplicate_apr`
 7) `_classify_truncated_rows` -> matched/unmatched truncated CSVs
-8) write cleaned APR + malformed drops; print structured stdout summary (no recovery_summary CSV)
+8) write cleaned APR + malformed drops; print structured stdout summary
 
-Diagnostics snapshot (2026-04-16 run; `tablea2.csv` in `CSVparse_hcd_apr/`)
-- Step 1 (structural repair): `rows_parsed_before_fix=786023`, `rows_parsed_after_fix=785393`,
-  `net_row_delta_after_minus_before=-630`, `opener_replacements=135`, `closer_replacements=89`.
-- Step 2 (main parse): `rows_loaded_main_pipeline=785449`.
-- Step 3 (in-memory cleanup): `affordability_trailing_quote_cells_fixed=15`,
-  `column_shift_rows_repaired=34`.
-- Step 4 (truncated physical lines): `truncated_closer_rows=80`.
-- Step 5 (XLSM upsert + quote cleanup): `truncated_identities_detected=78`,
-  `truncated_identities_resolved_update=25`, `truncated_identities_resolved_append=47`,
-  `truncated_identities_unresolved=0`, `truncated_identities_ambiguous=6`,
-  `truncated_xlsm_match_integrity_errors=0`,
-  `truncated_xlsm_equivalent_duplicates_collapsed=1`,
-  `truncated_rows_unresolved_after_xlsm=6`, `rows_after_upsert=785496`,
-  `affordability_lone_quote_cells_fixed=9`.
-- Step 6 (validation + dedup): `rows_dropped_date_mismatch=26559`,
-  `rows_dropped_invalid_year=229`, `rows_dropped_validation=26788`,
-  `dedup_rows_removed=17127`, `rows_after_filters=741581`.
-- Step 7 (truncated classification outputs): `matched_truncated_repair.csv=75`,
-  `unmatched_truncated_repair.csv=5`.
-- Step 8 (final artifacts): wrote `tablea2_cleaned_parsefilter_repair.csv`,
-  `ambiguous_truncated_repair.csv=6`.
-
-Output files (all written to the repo root unless paths are overridden via `run_repair`)
-- Primary: `tablea2_cleaned_parsefilter_repair.csv`
+Output files (all written to the repo root unless paths are overridden via `run_repair`;
+the authoritative list is the path assignment in `_set_paths`)
+- Primary: `tablea2_cleaned_parsefilter_repair.csv` — the only artifact downstream consumers
+  (e.g. `charts/basic_apr_charts.py`) read.
 - Truncated classification: `matched_truncated_repair.csv`, `unmatched_truncated_repair.csv`
 - Upsert ambiguity audit: `ambiguous_truncated_repair.csv`
 - Dropped rows (date mismatches + invalid years): `date_year_mismatch_rows_parsefilter_repair.csv`
-- Metrics: stdout block only (not written to a metrics CSV)
+- Metrics: stdout summary block only. Metric names are defined by the `metrics` list in `main`;
+  per-run values are deliberately not recorded here, since a pasted snapshot goes stale silently.
 """
 
 import csv
@@ -122,15 +133,6 @@ _THIS_DIR = Path(__file__).resolve().parent
 # This script and the .xlsm workbooks live in data-cleanup/; the CSV data it reads and
 # writes lives at the repo root, where every downstream consumer expects it.
 _REPO_ROOT = _THIS_DIR.parent
-
-_input_dir = _REPO_ROOT
-_output_dir = _REPO_ROOT
-apr_path = _input_dir / "tablea2.csv"
-cleaned_path = _output_dir / "tablea2_cleaned_parsefilter_repair.csv"
-date_year_mismatch_path = _output_dir / "date_year_mismatch_rows_parsefilter_repair.csv"
-matched_truncated_path = _output_dir / "matched_truncated_repair.csv"
-unmatched_truncated_path = _output_dir / "unmatched_truncated_repair.csv"
-ambiguous_truncated_path = _output_dir / "ambiguous_truncated_repair.csv"
 
 
 def _set_paths(base_dir: Path, output_dir: Path | None = None) -> None:
@@ -153,6 +155,9 @@ def _set_paths(base_dir: Path, output_dir: Path | None = None) -> None:
     unmatched_truncated_path = _output_dir / "unmatched_truncated_repair.csv"
     ambiguous_truncated_path = _output_dir / "ambiguous_truncated_repair.csv"
 
+
+_set_paths(_REPO_ROOT)
+
 _A2_REQUIRED_HEADERS = {"A2_1_ID", "A2_18_Affordable"}
 _A2_TEXT_COLUMNS = ("NO_FA_DR", "NOTES", "FIN_ASSIST_NAME")
 _XLSM_TO_APR_PHASE = (
@@ -161,9 +166,12 @@ _XLSM_TO_APR_PHASE = (
     ("A2_10_Units", "NO_OTHER_FORMS_OF_READINESS"),
 )
 
+IDENTITY_KEY_COLS = ["JURIS_NAME", "CNTY_NAME", "YEAR", "APN", "STREET_ADDRESS", "JURS_TRACKING_ID"]
+PHASE_APR_COLS = [apr for _, apr in _XLSM_TO_APR_PHASE]
+
 APR_DEDUP_COLS = [
     "JURIS_NAME", "CNTY_NAME", "YEAR", "APN", "STREET_ADDRESS", "PROJECT_NAME",
-    "NO_BUILDING_PERMITS", "NO_ENTITLEMENTS", "NO_OTHER_FORMS_OF_READINESS", "DEM_DES_UNITS",
+    *PHASE_APR_COLS, "DEM_DES_UNITS",
 ]
 
 _DATE_CHECK_CONFIG = [
@@ -184,7 +192,7 @@ def _deduplicate_apr(df):
     if len(cols) != len(APR_DEDUP_COLS):
         return df, 0
     n_before = len(df)
-    numeric_cols = ["NO_BUILDING_PERMITS", "NO_ENTITLEMENTS", "NO_OTHER_FORMS_OF_READINESS", "DEM_DES_UNITS"]
+    numeric_cols = PHASE_APR_COLS + ["DEM_DES_UNITS"]
     df = df.assign(**{c: pd.to_numeric(df[c], errors='coerce').fillna(0) for c in numeric_cols if c in df.columns}
     ).drop_duplicates(subset=cols, keep="first")
     return df, n_before - len(df)
@@ -249,7 +257,6 @@ def _repair_quote_corruption(raw_text):
     closer_pattern = re.compile(r"^([A-Z][A-Z ]*?)" + quote * 3 + r"([,\n\r])")
     lines = raw_text.splitlines(keepends=True)
     repaired_lines = []
-    opener_lines = set()
     closer_lines = set()
     replaced_openers = 0
     replaced_closers = 0
@@ -257,7 +264,6 @@ def _repair_quote_corruption(raw_text):
     for line_no, line in enumerate(lines, start=1):
         cursor = 0
         out = []
-        replaced_any = False
         while True:
             pos = line.find(opener, cursor)
             if pos == -1:
@@ -272,16 +278,13 @@ def _repair_quote_corruption(raw_text):
             out.append("," + backslash + backslash)
             cursor = after
             replaced_openers += 1
-            replaced_any = True
         repaired = "".join(out)
         repaired, n_close = closer_pattern.subn(r"\1\2", repaired)
-        if replaced_any:
-            opener_lines.add(line_no)
         if n_close:
             replaced_closers += n_close
             closer_lines.add(line_no)
         repaired_lines.append(repaired)
-    return "".join(repaired_lines), replaced_openers, replaced_closers, (opener_lines | closer_lines)
+    return "".join(repaired_lines), replaced_openers, replaced_closers, closer_lines
 
 
 def _count_csv_rows(csv_text):
@@ -293,18 +296,17 @@ def _count_csv_rows(csv_text):
 
 def _strip_affordability_trailing_quotes(df):
     """Strip one trailing ASCII quote from known HCD/ABAG boilerplate in text columns."""
-    cols = [c for c in ("NO_FA_DR", "NOTES", "FIN_ASSIST_NAME") if c in df.columns]
+    cols = [c for c in _A2_TEXT_COLUMNS if c in df.columns]
     if not cols:
         return 0
     n_cells = 0
     for col in cols:
         ser = df[col]
         s = ser.astype(str)
-        is_na = ser.isna()
-        match_prefix = s.str.match(_AFFORDABILITY_BOILERPLATE_PREFIX, na=False) & ~is_na
+        match_prefix = s.str.match(_AFFORDABILITY_BOILERPLATE_PREFIX, na=False)
         stripped = s.str.rstrip()
         ends_quote = stripped.str.endswith('"')
-        to_fix = match_prefix & ends_quote & ~is_na
+        to_fix = match_prefix & ends_quote
         if not to_fix.any():
             continue
         newvals = stripped[to_fix].str.slice(0, -1).str.rstrip()
@@ -375,38 +377,30 @@ def _classify_truncated_rows(df_clean, truncated_df):
     if any(c not in df_clean.columns for c in key_cols):
         return pd.DataFrame(), truncated_df.copy()
     _clean = df_clean.copy()
-    juris = _clean["JURIS_NAME"].astype(str).str.strip().str.upper()
-    cnty = _clean["CNTY_NAME"].astype(str).str.strip().str.upper()
-    apn = _clean["APN"].astype(str).str.strip().str.upper()
-    addr = _clean["STREET_ADDRESS"].astype(str).str.strip().str.upper()
+    norm = {c: _clean[c].astype(str).str.strip().str.upper() for c in key_cols}
     year_num = pd.to_numeric(_clean["YEAR"], errors="coerce")
-    activity = (
-        pd.to_numeric(_clean.get("NO_ENTITLEMENTS"), errors="coerce").fillna(0)
-        + pd.to_numeric(_clean.get("NO_BUILDING_PERMITS"), errors="coerce").fillna(0)
-        + pd.to_numeric(_clean.get("NO_OTHER_FORMS_OF_READINESS"), errors="coerce").fillna(0)
+    activity = sum(
+        pd.to_numeric(_clean.get(col), errors="coerce").fillna(0) for col in PHASE_APR_COLS
     )
     strict_map = defaultdict(list)
     relaxed_map = defaultdict(list)
     fallback_map = defaultdict(list)
     for idx in _clean.index:
-        strict_map[(juris.loc[idx], cnty.loc[idx], apn.loc[idx], addr.loc[idx])].append(idx)
-        relaxed_map[(juris.loc[idx], cnty.loc[idx], apn.loc[idx])].append(idx)
-        fallback_map[(juris.loc[idx], apn.loc[idx])].append(idx)
+        strict_map[(norm["JURIS_NAME"].loc[idx], norm["CNTY_NAME"].loc[idx], norm["APN"].loc[idx], norm["STREET_ADDRESS"].loc[idx])].append(idx)
+        relaxed_map[(norm["JURIS_NAME"].loc[idx], norm["CNTY_NAME"].loc[idx], norm["APN"].loc[idx])].append(idx)
+        fallback_map[(norm["JURIS_NAME"].loc[idx], norm["APN"].loc[idx])].append(idx)
 
     matched_records = []
     unmatched_records = []
     for _, row in truncated_df.iterrows():
-        juris_k = str(row.get("JURIS_NAME", "")).strip().upper()
-        cnty_k = str(row.get("CNTY_NAME", "")).strip().upper()
-        apn_k = str(row.get("APN", "")).strip().upper()
-        addr_k = str(row.get("STREET_ADDRESS", "")).strip().upper()
-        idxs = strict_map.get((juris_k, cnty_k, apn_k, addr_k), [])
+        row_k = {c: str(row.get(c, "")).strip().upper() for c in key_cols}
+        idxs = strict_map.get((row_k["JURIS_NAME"], row_k["CNTY_NAME"], row_k["APN"], row_k["STREET_ADDRESS"]), [])
         stage = "strict_juris_cnty_apn_addr"
         if not idxs:
-            idxs = relaxed_map.get((juris_k, cnty_k, apn_k), [])
+            idxs = relaxed_map.get((row_k["JURIS_NAME"], row_k["CNTY_NAME"], row_k["APN"]), [])
             stage = "relaxed_juris_cnty_apn"
         if not idxs:
-            idxs = fallback_map.get((juris_k, apn_k), [])
+            idxs = fallback_map.get((row_k["JURIS_NAME"], row_k["APN"]), [])
             stage = "relaxed_juris_apn"
         rec = row.to_dict()
         if not idxs:
@@ -416,7 +410,7 @@ def _classify_truncated_rows(df_clean, truncated_df):
             rec["max_pipeline_activity"] = 0
             unmatched_records.append(rec)
             continue
-        max_activity = float(activity.loc[idxs].max()) if idxs else 0.0
+        max_activity = float(activity.loc[idxs].max())
         years = sorted(int(y) for y in year_num.loc[idxs].dropna().unique())
         rec["verdict"] = "matched_active" if max_activity > 0 else "matched_zero"
         rec["match_stage"] = stage
@@ -501,9 +495,6 @@ def map_a2_row_to_apr_record(a2_row, identity_row):
         "JURS_TRACKING_ID": a2_row.get("A2_1_ID", ""),
         "UNIT_CAT": a2_row.get("A2_2_Unit", ""),
         "TENURE": a2_row.get("A2_3_Tenure", ""),
-        "NO_ENTITLEMENTS": a2_row.get("A2_6_Units", ""),
-        "NO_BUILDING_PERMITS": a2_row.get("A2_9_Units", ""),
-        "NO_OTHER_FORMS_OF_READINESS": a2_row.get("A2_10_Units", ""),
         "EXTR_LOW_INCOME_UNITS": a2_row.get("A2_13_xLow", ""),
         "APPROVE_SB35": a2_row.get("A2_14_Stream", ""),
         "INFILL_UNITS": a2_row.get("A2_15_Infill", ""),
@@ -520,6 +511,8 @@ def map_a2_row_to_apr_record(a2_row, identity_row):
         "DENSITY_BONUS_RECEIVE_REDUCTION": a2_row.get("A2_25_DB", ""),
         "NOTES": a2_row.get("A2_21_Notes", ""),
     }
+    for xlsm_key, apr_col in _XLSM_TO_APR_PHASE:
+        mapped[apr_col] = a2_row.get(xlsm_key, "")
     # Income-tier unit counts, per development stage. HCD codes the stage as the field
     # number (A2_4 entitlement, A2_7 building permit, A2_10 certificate of occupancy) and
     # the deed restriction as a Deed/None suffix. Unlike the identity fields above these
@@ -541,7 +534,7 @@ def _lone_quote_cleanup(df):
     for col in [c for c in _A2_TEXT_COLUMNS if c in df.columns]:
         ser = df[col]
         as_str = ser.astype(str).str.strip()
-        mask = (~ser.isna()) & as_str.eq('"')
+        mask = as_str.eq('"')
         if not mask.any():
             continue
         df.loc[mask, col] = ""
@@ -552,11 +545,11 @@ def _lone_quote_cleanup(df):
 def _dedupe_truncated_identities(truncated_rows):
     if truncated_rows.empty:
         return pd.DataFrame()
-    key_cols = ["JURIS_NAME", "CNTY_NAME", "YEAR", "APN", "STREET_ADDRESS", "JURS_TRACKING_ID"]
-    for col in key_cols:
-        if col not in truncated_rows.columns:
-            truncated_rows[col] = ""
+    key_cols = IDENTITY_KEY_COLS
     keyed = truncated_rows.copy()
+    for col in key_cols:
+        if col not in keyed.columns:
+            keyed[col] = ""
     for col in key_cols:
         keyed[col] = keyed[col].map(_norm_str)
     deduped = keyed.drop_duplicates(subset=key_cols, keep="first").copy()
@@ -564,14 +557,7 @@ def _dedupe_truncated_identities(truncated_rows):
 
 
 def _identity_key(row):
-    return (
-        _norm_str(row.get("JURIS_NAME", "")),
-        _norm_str(row.get("CNTY_NAME", "")),
-        _norm_str(row.get("YEAR", "")),
-        _norm_str(row.get("APN", "")),
-        _norm_str(row.get("STREET_ADDRESS", "")),
-        _norm_str(row.get("JURS_TRACKING_ID", "")),
-    )
+    return tuple(_norm_str(row.get(col, "")) for col in IDENTITY_KEY_COLS)
 
 
 def _build_identity_source_map(truncated_rows):
@@ -607,24 +593,6 @@ def _identity_context(identity, source_info, workbook_path):
     }
 
 
-def _make_ambiguous_record(stage, xlsm_count, df_count, identity, source_info, workbook_path):
-    rec = _identity_context(identity, source_info, workbook_path)
-    rec.update(
-        {
-            "ambiguity_stage": stage,
-            "xlsm_candidate_count": xlsm_count,
-            "df_candidate_count": df_count,
-            "match_stage_used": "",
-            "excel_row_numbers": "",
-            "candidate_key_digest": "",
-            "integrity_violation_reason": "",
-            "integrity_expected_tracking_id": "",
-            "integrity_candidate_tracking_ids": "",
-        }
-    )
-    return rec
-
-
 def _candidate_excel_row_numbers(candidates):
     row_numbers = []
     for candidate in candidates:
@@ -645,13 +613,6 @@ def _candidate_key_digest(candidates):
     return " ; ".join(parts)
 
 
-def _with_match_provenance(record, match_stage_used, excel_row_numbers, candidate_key_digest):
-    record["match_stage_used"] = match_stage_used
-    record["excel_row_numbers"] = "|".join(str(v) for v in excel_row_numbers if str(v))
-    record["candidate_key_digest"] = candidate_key_digest
-    return record
-
-
 def _build_ambiguity_record(
     stage,
     xlsm_count,
@@ -664,10 +625,22 @@ def _build_ambiguity_record(
     candidate_key_digest="",
     integrity_issue=None,
 ):
-    record = _make_ambiguous_record(stage, xlsm_count, df_count, identity, source_info, workbook_path)
     if excel_row_numbers is None:
         excel_row_numbers = []
-    record = _with_match_provenance(record, match_stage_used, excel_row_numbers, candidate_key_digest)
+    record = _identity_context(identity, source_info, workbook_path)
+    record.update(
+        {
+            "ambiguity_stage": stage,
+            "xlsm_candidate_count": xlsm_count,
+            "df_candidate_count": df_count,
+            "match_stage_used": match_stage_used,
+            "excel_row_numbers": "|".join(str(v) for v in excel_row_numbers if str(v)),
+            "candidate_key_digest": candidate_key_digest,
+            "integrity_violation_reason": "",
+            "integrity_expected_tracking_id": "",
+            "integrity_candidate_tracking_ids": "",
+        }
+    )
     if integrity_issue:
         record.update(integrity_issue)
     return record
@@ -739,15 +712,22 @@ def _find_a2_matches(indexes, identity):
     }
 
 
-def _df_update_match_indices(df, identity):
-    key_cols = ["JURIS_NAME", "CNTY_NAME", "YEAR", "APN", "STREET_ADDRESS", "JURS_TRACKING_ID"]
-    for col in key_cols:
+def _build_identity_index(df):
+    for col in IDENTITY_KEY_COLS:
         if col not in df.columns:
-            return []
-    mask = pd.Series(True, index=df.index)
-    for col in key_cols:
-        mask = mask & df[col].map(_norm_str).eq(_norm_str(identity.get(col, "")))
-    return df.index[mask].tolist()
+            return None
+    cols = [df[col].map(_norm_str).tolist() for col in IDENTITY_KEY_COLS]
+    index = defaultdict(list)
+    for pos, idx in enumerate(df.index):
+        key = tuple(c[pos] for c in cols)
+        index[key].append(idx)
+    return index
+
+
+def _identity_matches(identity_index, identity):
+    if identity_index is None:
+        return []
+    return identity_index.get(_identity_key(identity), [])
 
 
 def _apply_mapped_to_df_row(df, idx, mapped):
@@ -764,7 +744,7 @@ def _apply_paired_upserts(pairs, df, identity):
     return len(pairs)
 
 
-def _resolve_multi_xlsm(matches, identity, df):
+def _resolve_multi_xlsm(matches, identity, df, identity_index):
     """Resolve multiple XLSM candidates for one truncated identity.
 
     Returns (resolution, mapped_candidates_or_None, pairs_or_None):
@@ -775,7 +755,7 @@ def _resolve_multi_xlsm(matches, identity, df):
     mapped_candidates = [map_a2_row_to_apr_record(c, identity) for c in matches]
     if _all_mapped_payloads_equivalent(mapped_candidates):
         return "collapsed", mapped_candidates, None
-    update_idxs = _df_update_match_indices(df, identity)
+    update_idxs = _identity_matches(identity_index, identity)
     pairs = _pair_xlsm_to_df_by_phase(matches, update_idxs, df)
     if pairs is not None:
         return "paired", None, pairs
@@ -822,17 +802,22 @@ def _pair_xlsm_to_df_by_phase(xlsm_rows, df_idxs, df):
     return pairs
 
 
-def _append_with_dtype_defaults(df, mapped_row):
-    row = {}
-    for col in df.columns:
-        if col in mapped_row:
-            row[col] = mapped_row[col]
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            row[col] = np.nan
-        else:
-            row[col] = ""
-    return pd.concat([df, pd.DataFrame([row], columns=df.columns)], ignore_index=True)
+def _append_rows_with_dtype_defaults(df, mapped_rows):
+    if not mapped_rows:
+        return df
+    numeric_cols = {col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])}
+    rows = []
+    for mapped_row in mapped_rows:
+        row = {}
+        for col in df.columns:
+            if col in mapped_row:
+                row[col] = mapped_row[col]
+            elif col in numeric_cols:
+                row[col] = np.nan
+            else:
+                row[col] = ""
+        rows.append(row)
+    return pd.concat([df, pd.DataFrame(rows, columns=df.columns)], ignore_index=True)
 
 
 def _print_summary_block(metrics):
@@ -868,10 +853,12 @@ def _apply_validation_filters(df):
     return df_clean, df_dropped_mismatch, df_dropped_year, df_dropped
 
 
-def _process_truncated_identity(identity, identity_source_map, workbook_cache, df):
+def _process_truncated_identity(identity, identity_source_map, workbook_cache, df, identity_index):
     counters = {
         "upsert_update": 0,
         "upsert_append": 0,
+        "upsert_paired": 0,
+        "upsert_rows_via_pairing": 0,
         "upsert_unresolved": 0,
         "upsert_ambiguous": 0,
         "upsert_integrity_error": 0,
@@ -882,7 +869,7 @@ def _process_truncated_identity(identity, identity_source_map, workbook_cache, d
     workbook_path = _resolve_workbook_path(identity)
     if workbook_path is None:
         counters["upsert_unresolved"] += 1
-        return df, counters, records
+        return counters, records, None
     indexes = _load_a2_rows_with_indexes(workbook_path, workbook_cache)
     match_result = _find_a2_matches(indexes, identity)
     matches = match_result["candidates"]
@@ -890,87 +877,65 @@ def _process_truncated_identity(identity, identity_source_map, workbook_cache, d
     excel_row_numbers = match_result["excel_row_numbers"]
     candidate_key_digest = _candidate_key_digest(matches)
     integrity_issue = _tracking_stage_integrity_issue(match_result, identity)
+    ambiguity_ctx = dict(
+        identity=identity,
+        source_info=source_info,
+        workbook_path=workbook_path,
+        match_stage_used=match_stage_used,
+        excel_row_numbers=excel_row_numbers,
+        candidate_key_digest=candidate_key_digest,
+    )
     if integrity_issue is not None:
         counters["upsert_integrity_error"] += 1
         records.append(
             _build_ambiguity_record(
-                "xlsm_match_integrity_error",
-                len(matches),
-                0,
-                identity,
-                source_info,
-                workbook_path,
-                match_stage_used=match_stage_used,
-                excel_row_numbers=excel_row_numbers,
-                candidate_key_digest=candidate_key_digest,
-                integrity_issue=integrity_issue,
+                "xlsm_match_integrity_error", len(matches), 0, **ambiguity_ctx, integrity_issue=integrity_issue
             )
         )
-        return df, counters, records
+        return counters, records, None
     if not matches:
         counters["upsert_unresolved"] += 1
-        return df, counters, records
+        return counters, records, None
     if len(matches) == 1:
         mapped = map_a2_row_to_apr_record(matches[0], identity)
     else:
-        resolution, payload, pairs = _resolve_multi_xlsm(matches, identity, df)
+        resolution, payload, pairs = _resolve_multi_xlsm(matches, identity, df, identity_index)
         if resolution == "paired":
-            counters["upsert_update"] += _apply_paired_upserts(pairs, df, identity)
-            return df, counters, records
+            counters["upsert_rows_via_pairing"] += _apply_paired_upserts(pairs, df, identity)
+            counters["upsert_paired"] += 1
+            return counters, records, None
         if resolution == "ambiguous":
             counters["upsert_ambiguous"] += 1
             records.append(
-                _build_ambiguity_record(
-                    "xlsm_multi_match",
-                    len(matches),
-                    0,
-                    identity,
-                    source_info,
-                    workbook_path,
-                    match_stage_used=match_stage_used,
-                    excel_row_numbers=excel_row_numbers,
-                    candidate_key_digest=candidate_key_digest,
-                )
+                _build_ambiguity_record("xlsm_multi_match", len(matches), 0, **ambiguity_ctx)
             )
-            return df, counters, records
+            return counters, records, None
         mapped = payload[_deterministic_candidate_index(excel_row_numbers)]
         counters["equivalent_duplicates_collapsed"] += 1
-    update_idxs = _df_update_match_indices(df, identity)
+    update_idxs = _identity_matches(identity_index, identity)
     if len(update_idxs) > 1:
         pairs = _pair_xlsm_to_df_by_phase(matches, update_idxs, df)
         if pairs is None:
             counters["upsert_ambiguous"] += 1
             records.append(
-                _build_ambiguity_record(
-                    "df_multi_match",
-                    len(matches),
-                    len(update_idxs),
-                    identity,
-                    source_info,
-                    workbook_path,
-                    match_stage_used=match_stage_used,
-                    excel_row_numbers=excel_row_numbers,
-                    candidate_key_digest=candidate_key_digest,
-                )
+                _build_ambiguity_record("df_multi_match", len(matches), len(update_idxs), **ambiguity_ctx)
             )
-            return df, counters, records
-        counters["upsert_update"] += _apply_paired_upserts(pairs, df, identity)
-        return df, counters, records
+            return counters, records, None
+        counters["upsert_rows_via_pairing"] += _apply_paired_upserts(pairs, df, identity)
+        counters["upsert_paired"] += 1
+        return counters, records, None
     if len(update_idxs) == 1:
         _apply_mapped_to_df_row(df, update_idxs[0], mapped)
         counters["upsert_update"] += 1
-        return df, counters, records
-    df = _append_with_dtype_defaults(df, mapped)
+        return counters, records, None
     counters["upsert_append"] += 1
-    return df, counters, records
+    return counters, records, mapped
 
 
 def main():
     print(f"Loading: {apr_path}")
     raw_csv = apr_path.read_text(encoding="utf-8", errors="replace")
-    fixed_csv, n_openers, n_closers, _ = _repair_quote_corruption(raw_csv)
-    closer_pattern = re.compile(r"^([A-Z][A-Z ]*?)\"\"\"([,\n\r])")
-    closer_lines = {i for i, line in enumerate(raw_csv.splitlines(), start=1) if closer_pattern.match(line)}
+    fixed_csv, n_openers, n_closers, closer_lines = _repair_quote_corruption(raw_csv)
 
     rows_before_fix = _count_csv_rows(raw_csv)
     rows_after_fix = _count_csv_rows(fixed_csv)
@@ -984,22 +949,47 @@ def main():
     identities = _dedupe_truncated_identities(truncated_rows)
     identity_source_map = _build_identity_source_map(truncated_rows)
     workbook_cache = {}
+    identity_index = _build_identity_index(df)
     upsert_update = 0
     upsert_append = 0
+    upsert_paired = 0
+    upsert_rows_via_pairing = 0
     upsert_unresolved = 0
     upsert_ambiguous = 0
     upsert_integrity_error = 0
     equivalent_duplicates_collapsed = 0
     ambiguous_records = []
+    pending_appends = []
     for _, identity in identities.iterrows():
-        df, counters, identity_records = _process_truncated_identity(identity, identity_source_map, workbook_cache, df)
+        counters, identity_records, pending_append = _process_truncated_identity(
+            identity, identity_source_map, workbook_cache, df, identity_index
+        )
         upsert_update += counters["upsert_update"]
         upsert_append += counters["upsert_append"]
+        upsert_paired += counters["upsert_paired"]
+        upsert_rows_via_pairing += counters["upsert_rows_via_pairing"]
         upsert_unresolved += counters["upsert_unresolved"]
         upsert_ambiguous += counters["upsert_ambiguous"]
         upsert_integrity_error += counters["upsert_integrity_error"]
         equivalent_duplicates_collapsed += counters["equivalent_duplicates_collapsed"]
         ambiguous_records.extend(identity_records)
+        if pending_append is not None:
+            pending_appends.append(pending_append)
+
+    df = _append_rows_with_dtype_defaults(df, pending_appends)
+
+    _resolved_total = (
+        upsert_update + upsert_append + upsert_paired
+        + upsert_ambiguous + upsert_unresolved + upsert_integrity_error
+    )
+    if _resolved_total != len(identities):
+        raise AssertionError(
+            "truncated identity accounting mismatch: "
+            f"detected={len(identities)} update={upsert_update} append={upsert_append} "
+            f"paired={upsert_paired} ambiguous={upsert_ambiguous} "
+            f"unresolved={upsert_unresolved} integrity={upsert_integrity_error} "
+            f"sum={_resolved_total}"
+        )
 
     lone_quote_cells_fixed = _lone_quote_cleanup(df)
     truncated_rows_unresolved_after_xlsm = upsert_unresolved + upsert_ambiguous + upsert_integrity_error
@@ -1030,6 +1020,8 @@ def main():
         ("truncated_identities_detected", len(identities)),
         ("truncated_identities_resolved_update", upsert_update),
         ("truncated_identities_resolved_append", upsert_append),
+        ("truncated_identities_resolved_paired", upsert_paired),
+        ("truncated_rows_updated_via_pairing", upsert_rows_via_pairing),
         ("truncated_identities_unresolved", upsert_unresolved),
         ("truncated_identities_ambiguous", upsert_ambiguous),
         ("truncated_xlsm_match_integrity_errors", upsert_integrity_error),
